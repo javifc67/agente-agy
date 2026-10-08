@@ -19,9 +19,10 @@ import readline
 from pathlib import Path
 from dotenv import load_dotenv
 
+import httpx
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut, TelegramError
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,8 +33,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Configuración de logs (silenciar sondeos repetitivos de red)
+BASE_DIR = Path(__file__).resolve().parent
+LOG_FILE = BASE_DIR / "bot.log"
+load_dotenv(BASE_DIR / ".env")
+
+# Configuración de logs: guardar trazas en bot.log para no ensuciar la consola interactiva
 logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="a",
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
@@ -55,8 +62,27 @@ def safe_console_print(text: str):
     except Exception:
         print(text, flush=True)
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+
+async def retry_telegram_call(coro_fn, *args, retries: int = 3, delay: float = 1.0, **kwargs):
+    """Reintenta automáticamente llamadas asíncronas a Telegram ante microcortes de red transitorios."""
+    for attempt in range(retries):
+        try:
+            return await coro_fn(*args, **kwargs)
+        except (NetworkError, TimedOut, httpx.HTTPError) as err:
+            if attempt < retries - 1:
+                logger.warning(f"Reintentando llamada Telegram ({attempt + 1}/{retries}) tras corte de red: {err}")
+                await asyncio.sleep(delay * (attempt + 1))
+            else:
+                logger.error(f"Fallo definitivo de red en Telegram tras {retries} intentos: {err}")
+                raise
+
+
+async def safe_reply(message, text: str, parse_mode: str = "Markdown"):
+    """Envía una respuesta con reintentos y tolerancia a fallos de formato Markdown."""
+    try:
+        return await retry_telegram_call(message.reply_text, text, parse_mode=parse_mode)
+    except BadRequest:
+        return await retry_telegram_call(message.reply_text, text)
 
 # Configuración
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -110,40 +136,54 @@ def split_message(text: str, max_length: int = 4000) -> list[str]:
 
 
 async def send_or_edit(bot, chat_id: int, text: str, edit_message_id: int | None = None):
-    """Envía o edita texto en Telegram con fallback seguro."""
+    """Envía o edita texto en Telegram con fallback seguro y reintentos automáticos."""
     chunks = split_message(text)
+    if not chunks:
+        return
+
     first_chunk = chunks[0]
 
     if edit_message_id:
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=first_chunk,
-                parse_mode="Markdown",
-            )
-        except BadRequest:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=edit_message_id,
-                text=first_chunk,
-            )
-        remaining_chunks = chunks[1:]
+            try:
+                await retry_telegram_call(
+                    bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=edit_message_id,
+                    text=first_chunk,
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await retry_telegram_call(
+                    bot.edit_message_text,
+                    chat_id=chat_id,
+                    message_id=edit_message_id,
+                    text=first_chunk,
+                )
+            remaining_chunks = chunks[1:]
+        except Exception as e:
+            logger.warning(f"No se pudo editar mensaje {edit_message_id}: {e}. Enviando como nuevo mensaje.")
+            remaining_chunks = chunks
     else:
         remaining_chunks = chunks
 
     for chunk in remaining_chunks:
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-                parse_mode="Markdown",
-            )
-        except BadRequest:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=chunk,
-            )
+            try:
+                await retry_telegram_call(
+                    bot.send_message,
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await retry_telegram_call(
+                    bot.send_message,
+                    chat_id=chat_id,
+                    text=chunk,
+                )
+        except Exception as e:
+            logger.error(f"Error definitivo enviando mensaje a Telegram chat {chat_id}: {e}")
 
 
 # ====================================================================
@@ -338,12 +378,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• `/reset` - Reinicia el hilo de la conversación\n\n"
         f"Escríbeme cualquier tarea directamente para que la ejecute en tu Linux."
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await safe_reply(update.message, msg, parse_mode="Markdown")
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra el ID de usuario de Telegram."""
-    await update.message.reply_text(
+    await safe_reply(
+        update.message,
         f"Tu ID de usuario de Telegram es:\n`{update.effective_user.id}`",
         parse_mode="Markdown",
     )
@@ -352,7 +393,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra el estado del agente y agy."""
     if not check_auth(update.effective_user.id):
-        await update.message.reply_text("⛔ No autorizado.")
+        await safe_reply(update.message, "⛔ No autorizado.")
         return
 
     msg = (
@@ -363,18 +404,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Conversación ID**: `{CONVERSATION_ID or 'Continuidad activa (-c)'}`\n"
         f"• **Directorio de trabajo**: `{BASE_DIR}`"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await safe_reply(update.message, msg, parse_mode="Markdown")
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reinicia la conversación en agy."""
     if not check_auth(update.effective_user.id):
-        await update.message.reply_text("⛔ No autorizado.")
+        await safe_reply(update.message, "⛔ No autorizado.")
         return
 
     global CONVERSATION_ID
     CONVERSATION_ID = None
-    await update.message.reply_text("🧹 Memoria de conversación reiniciada en agy.")
+    await safe_reply(update.message, "🧹 Memoria de conversación reiniciada en agy.")
 
 
 async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event):
@@ -394,14 +435,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Maneja mensajes de texto entrantes de Telegram."""
     user = update.effective_user
     if not check_auth(user.id):
-        await update.message.reply_text("⛔ No estás autorizado.")
+        await safe_reply(update.message, "⛔ No estás autorizado.")
         return
 
     user_text = update.message.text.strip()
     if not user_text:
         return
 
-    status_msg = await update.message.reply_text("🧠 *Ejecutando en agy...*", parse_mode="Markdown")
+    status_msg = None
+    try:
+        status_msg = await safe_reply(update.message, "🧠 *Ejecutando en agy...*", parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"No se pudo enviar mensaje de espera temporal: {e}")
+
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, update.effective_chat.id, stop_typing))
 
@@ -421,7 +467,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             bot=context.bot,
             chat_id=update.effective_chat.id,
             text=response_text,
-            edit_message_id=status_msg.message_id,
+            edit_message_id=status_msg.message_id if status_msg else None,
         )
 
     except Exception as e:
@@ -430,14 +476,26 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception("Error procesando mensaje:")
         err_msg = f"❌ *Error:*\n`{str(e)}`"
         try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=status_msg.message_id,
-                text=err_msg,
-                parse_mode="Markdown",
-            )
+            if status_msg:
+                await send_or_edit(
+                    bot=context.bot,
+                    chat_id=update.effective_chat.id,
+                    text=err_msg,
+                    edit_message_id=status_msg.message_id,
+                )
+            else:
+                await safe_reply(update.message, err_msg)
         except Exception:
-            await update.message.reply_text(err_msg)
+            pass
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Captura errores globales de la aplicación de Telegram evitando volcados en consola."""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut, httpx.HTTPError)):
+        logger.warning(f"Error de red temporal en Telegram ({type(err).__name__}): {err}")
+    else:
+        logger.error("Excepción no controlada en Telegram:", exc_info=err)
 
 
 # ====================================================================
@@ -491,6 +549,8 @@ def main():
         .post_shutdown(on_shutdown)
         .build()
     )
+
+    app.add_error_handler(global_error_handler)
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("id", id_command))
