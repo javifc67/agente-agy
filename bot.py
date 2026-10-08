@@ -190,12 +190,20 @@ async def send_or_edit(bot, chat_id: int, text: str, edit_message_id: int | None
 # Motor agy (Ejecución mediante tu cuenta de Google en Antigravity)
 # ====================================================================
 
-async def execute_agy(prompt: str, is_heartbeat: bool = False, print_to_console: bool = True) -> str:
-    """Ejecuta una petición usando el binario oficial de agy con streaming JSON."""
+async def execute_agy(
+    prompt: str,
+    source: str = "CONSOLA",
+    sender: str = "Tú",
+    is_heartbeat: bool = False,
+) -> str:
+    """Ejecuta una petición usando el binario oficial de agy mostrando toda la actividad (pensamiento, herramientas, streaming)."""
     global CONVERSATION_ID
 
     if not os.path.exists(AGY_BIN):
-        return f"Error: No se encontró el binario de agy en {AGY_BIN}"
+        err_msg = f"Error: No se encontró el binario de agy en {AGY_BIN}"
+        if not is_heartbeat:
+            safe_console_print(f"\033[1;31m❌ {err_msg}\033[0m")
+        return err_msg
 
     async with AGY_LOCK:
         cmd = [
@@ -211,9 +219,23 @@ async def execute_agy(prompt: str, is_heartbeat: bool = False, print_to_console:
         else:
             cmd.append("-c")
 
-        if print_to_console and not is_heartbeat:
-            print("\n" + "─" * 65, flush=True)
-            print(f"\033[1;36m🤖 AgyAgent [agy]\033[0m procesando: {prompt[:80]}...", flush=True)
+        # Preparar la consola (limpiar la línea de prompt para mostrar la actividad limpia)
+        buf = ""
+        if not is_heartbeat:
+            try:
+                buf = readline.get_line_buffer()
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+            print("\n" + "═" * 65, flush=True)
+            if source == "TELEGRAM":
+                print(f"💬 \033[1;36m[MENSAJE TELEGRAM]\033[0m \033[1m{sender}:\033[0m {prompt}", flush=True)
+            else:
+                print(f"👤 \033[1;32m[ORDEN CONSOLA]:\033[0m {prompt}", flush=True)
+            print(f"🤖 \033[1;35mAgyAgent [agy]\033[0m ejecutando...", flush=True)
+            print("─" * 65, flush=True)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -224,6 +246,8 @@ async def execute_agy(prompt: str, is_heartbeat: bool = False, print_to_console:
 
         accumulated_text = ""
         full_response = ""
+        thought_announced = False
+        reply_announced = False
 
         try:
             while True:
@@ -244,31 +268,105 @@ async def execute_agy(prompt: str, is_heartbeat: bool = False, print_to_console:
                     elif event == "step_update":
                         su = data.get("step_update", {})
                         step_type = su.get("step_type", "")
+                        state = su.get("state", "")
 
-                        # Notificar deltas de texto en terminal
-                        if "text_delta" in su and print_to_console and not is_heartbeat:
-                            delta = su["text_delta"]
-                            accumulated_text += delta
-                            sys.stdout.write(delta)
-                            sys.stdout.flush()
+                        if not is_heartbeat:
+                            # 1. Herramientas del sistema (bash, ficheros, web, etc.)
+                            if step_type == "tool":
+                                tool_name = su.get("tool_name") or su.get("tool_info", {}).get("name", "herramienta")
+                                tool_info = su.get("tool_info", {})
+
+                                if state == "ACTIVE":
+                                    params = tool_info.get("parameters", {})
+                                    param_strs = []
+                                    for k, v in params.items():
+                                        v_str = str(v).replace("\n", " ")
+                                        if len(v_str) > 80:
+                                            v_str = v_str[:77] + "..."
+                                        param_strs.append(f"{k}={v_str}")
+                                    p_display = ", ".join(param_strs) if param_strs else ""
+                                    print(f"\n\033[1;33m🛠️  [HERRAMIENTA: {tool_name}]\033[0m {p_display}", flush=True)
+
+                                elif state == "DONE":
+                                    dur = su.get("duration_seconds", 0)
+                                    out = str(tool_info.get("output", "")).strip()
+                                    if out:
+                                        out_lines = out.split("\n")
+                                        preview = out_lines[0] if len(out_lines) == 1 else f"{out_lines[0]} ... ({len(out_lines)} líneas)"
+                                        if len(preview) > 100:
+                                            preview = preview[:97] + "..."
+                                        print(f"\033[0;33m   └─ Salida ({dur:.2f}s):\033[0m {preview}", flush=True)
+                                    else:
+                                        print(f"\033[0;33m   └─ Completado en {dur:.2f}s\033[0m", flush=True)
+
+                            # 2. Pensamiento / Razonamiento
+                            elif step_type == "agent_response":
+                                if "thought_delta" in su:
+                                    if not thought_announced:
+                                        print(f"\n\033[0;35m🧠 [PENSAMIENTO / RAZONAMIENTO]:\033[0m", flush=True)
+                                        thought_announced = True
+                                    sys.stdout.write(f"\033[0;90m{su['thought_delta']}\033[0m")
+                                    sys.stdout.flush()
+
+                                elif "thought" in su and su["thought"]:
+                                    print(f"\n\033[0;90m🧠 [Pensamiento]: {su['thought']}\033[0m", flush=True)
+
+                                usage = su.get("usage", {})
+                                if usage.get("thinking_tokens", 0) > 0 and not thought_announced:
+                                    print(f"\n\033[0;35m🧠 [RAZONAMIENTO GEMINI]\033[0m ({usage['thinking_tokens']} tokens de pensamiento)", flush=True)
+                                    thought_announced = True
+
+                                # 3. Streaming de respuesta en tiempo real
+                                if "text_delta" in su:
+                                    delta = su["text_delta"]
+                                    accumulated_text += delta
+                                    if not reply_announced:
+                                        print(f"\n\033[1;32m💬 [RESPUESTA DE AGYAGENT]:\033[0m", flush=True)
+                                        reply_announced = True
+                                    sys.stdout.write(delta)
+                                    sys.stdout.flush()
+
+                        else:
+                            # Acumular texto para Heartbeat silencioso
+                            if "text_delta" in su:
+                                accumulated_text += su["text_delta"]
 
                     elif event == "result":
                         res = data.get("result", {})
                         full_response = res.get("response", "")
+                        usage = res.get("usage", {})
+                        if not is_heartbeat and usage:
+                            in_tok = usage.get("input_tokens", 0)
+                            out_tok = usage.get("output_tokens", 0)
+                            th_tok = usage.get("thinking_tokens", 0)
+                            print(f"\n\033[0;90m📊 Tokens: Entrada: {in_tok} | Salida: {out_tok} | Razonamiento: {th_tok}\033[0m", flush=True)
 
                 except json.JSONDecodeError:
                     pass
 
             await proc.wait()
 
-            if print_to_console and not is_heartbeat:
-                print("\n" + "─" * 65 + "\n", flush=True)
+            final_text = full_response or accumulated_text or "Tarea completada."
 
-            return full_response or accumulated_text or "Tarea completada."
+            if not is_heartbeat:
+                print("\n" + "═" * 65, flush=True)
+                if source == "TELEGRAM":
+                    print(f"\033[1;35m📤 [RESPUESTA ENVIADA A TELEGRAM]\033[0m a {sender}\n", flush=True)
+                    try:
+                        readline.redisplay()
+                    except Exception:
+                        pass
+                elif source == "CONSOLA":
+                    print(f"\033[1;32m✅ [COMPLETADO EN CONSOLA]\033[0m\n", flush=True)
+
+            return final_text
 
         except Exception as e:
             logger.exception("Error ejecutando agy:")
-            return f"Error en ejecución de agy: {str(e)}"
+            err_str = f"Error en ejecución de agy: {str(e)}"
+            if not is_heartbeat:
+                print(f"\n\033[1;31m❌ {err_str}\033[0m\n", flush=True)
+            return err_str
 
 
 # ====================================================================
@@ -296,7 +394,8 @@ async def heartbeat_loop(app: Application):
         try:
             await asyncio.sleep(HEARTBEAT_MINUTES * 60)
             logger.info("❤️ Pulso de Heartbeat ejecutándose...")
-            result = await execute_agy(prompt_heartbeat, is_heartbeat=True, print_to_console=False)
+            safe_console_print("\033[1;33m❤️ [HEARTBEAT]\033[0m Comprobando estado del sistema en segundo plano...")
+            result = await execute_agy(prompt_heartbeat, source="HEARTBEAT", sender="Heartbeat", is_heartbeat=True)
 
             if "SILENT_OK" not in result and result.strip():
                 logger.info("📢 Heartbeat detectó un aviso relevante. Notificando por Telegram...")
@@ -309,7 +408,7 @@ async def heartbeat_loop(app: Application):
                         parse_mode="Markdown",
                     )
             else:
-                logger.info("❤️ Heartbeat completado: Sistema en orden (SILENT_OK).")
+                safe_console_print("\033[0;90m❤️ [HEARTBEAT] Sistema en orden (SILENT_OK).\033[0m")
 
         except asyncio.CancelledError:
             break
@@ -347,7 +446,7 @@ async def console_input_loop(app: Application):
             continue
 
         # Procesar comando por agy
-        await execute_agy(prompt, is_heartbeat=False, print_to_console=True)
+        await execute_agy(prompt, source="CONSOLA", sender="Tú", is_heartbeat=False)
 
 
 # ====================================================================
@@ -358,6 +457,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja el comando /start en Telegram."""
     user = update.effective_user
     user_id = user.id if user else 0
+    safe_console_print(f"\033[1;36m📌 [TELEGRAM COMANDO]\033[0m {user.first_name if user else 'desconocido'}: /start")
 
     auth_status = "✅ *Autorizado*" if check_auth(user_id) else "⛔ *No Autorizado*"
     lock_note = ""
@@ -382,7 +482,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el ID de usuario de Telegram."""
+    """Maneja el comando /id en Telegram."""
+    user = update.effective_user
+    safe_console_print(f"\033[1;36m📌 [TELEGRAM COMANDO]\033[0m {user.first_name if user else 'desconocido'}: /id")
     await safe_reply(
         update.message,
         f"Tu ID de usuario de Telegram es:\n`{update.effective_user.id}`",
@@ -392,6 +494,8 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra el estado del agente y agy."""
+    user = update.effective_user
+    safe_console_print(f"\033[1;36m📌 [TELEGRAM COMANDO]\033[0m {user.first_name if user else 'desconocido'}: /status")
     if not check_auth(update.effective_user.id):
         await safe_reply(update.message, "⛔ No autorizado.")
         return
@@ -409,6 +513,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reinicia la conversación en agy."""
+    user = update.effective_user
+    safe_console_print(f"\033[1;33m📌 [TELEGRAM COMANDO]\033[0m {user.first_name if user else 'desconocido'}: /reset")
     if not check_auth(update.effective_user.id):
         await safe_reply(update.message, "⛔ No autorizado.")
         return
@@ -436,6 +542,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if not check_auth(user.id):
         await safe_reply(update.message, "⛔ No estás autorizado.")
+        safe_console_print(f"\033[1;31m⛔ [TELEGRAM NO AUTORIZADO]\033[0m Usuario {user.id} ({user.first_name}) intentó interactuar.")
         return
 
     user_text = update.message.text.strip()
@@ -451,17 +558,12 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(context.bot, update.effective_chat.id, stop_typing))
 
-    # Notificar en consola sin romper el texto que el usuario esté tecleando
-    safe_console_print(f"\033[1;36m💬 [TELEGRAM]\033[0m {user.first_name}: {user_text}")
-
     try:
-        # print_to_console=False para no volcar tokens de Telegram en medio de lo que escribes en la terminal
-        response_text = await execute_agy(user_text, is_heartbeat=False, print_to_console=False)
+        # Ejecutar en agy con salida detallada completa por consola (pensamiento, herramientas, streaming)
+        response_text = await execute_agy(user_text, source="TELEGRAM", sender=user.first_name, is_heartbeat=False)
 
         stop_typing.set()
         await typing_task
-
-        safe_console_print(f"\033[1;35m📤 [TELEGRAM RESPONDIDO]\033[0m a {user.first_name}")
 
         await send_or_edit(
             bot=context.bot,
